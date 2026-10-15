@@ -95,6 +95,49 @@ def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _router_resolved_path() -> Path:
+    """Path to the shienga auto-router's live category -> concrete-model snapshot.
+
+    The router that serves the ``hermes-*`` tiers publishes what each tier
+    currently resolves to here. ``HERMES_ROUTER_RESOLVED_PATH`` overrides the
+    location for tests / non-default state homes."""
+    override = os.environ.get("HERMES_ROUTER_RESOLVED_PATH")
+    if override:
+        return Path(override).expanduser()
+    state_home = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return state_home / "shienga" / "auto-router" / "resolved.json"
+
+
+def _router_resolved_for_tier(model: str) -> dict:
+    """The router's live resolution for a ``hermes-*`` tier, else ``{}``.
+
+    Returns ``{"model": ..., "provider": ...}`` — the concrete model the tier is
+    serving and the account serving it (account label, else account id, else the
+    provider family). The session banner uses both so it can name what actually
+    runs instead of the router placeholder (``custom``) and the bare category.
+    """
+    name = str(model or "").strip()
+    if not name.startswith("hermes-"):
+        return {}
+    try:
+        data = json.loads(_router_resolved_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    entry = (data.get("resolved") or {}).get(name) or {}
+    resolved_model = str(entry.get("model") or "").strip()
+    if not resolved_model or resolved_model == name:
+        return {}
+    provider = str(
+        entry.get("executor_label") or entry.get("executor") or entry.get("provider") or ""
+    ).strip()
+    return {"model": resolved_model, "provider": provider}
+
+
+def _router_resolved_model_for_tier(model: str) -> str:
+    """The concrete model a ``hermes-*`` router tier currently resolves to, else ""."""
+    return _router_resolved_for_tier(model).get("model", "")
+
+
 def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> bool:
     """One verdict for "this failed turn is a context overflow", shared by transcript persistence
     (#1630 skip) and the user-facing reply so the two can never disagree.
@@ -2355,9 +2398,18 @@ class GatewayTurnMixin:
             f"{context_length / 1_000_000:.1f}M" if context_length >= 1_000_000
             else f"{context_length // 1_000}K" if context_length >= 1_000 else str(context_length)
         )
+        routed = _router_resolved_for_tier(resolved.model)
+        model_line = t("gateway.session.info_model", model=resolved.model)
+        if routed.get("model"):
+            # The router pins the tier as the model; name the concrete model it
+            # is serving so the banner does not stop at ``hermes-medium``.
+            model_line = f"{model_line} → `{routed['model']}`"
+        # ``Provider: custom`` names only the router hop; when the router resolves
+        # the tier, report the account actually serving it instead.
+        provider_name = routed.get("provider") or resolved.provider or "openrouter"
         lines = [
-            t("gateway.session.info_model", model=resolved.model),
-            t("gateway.session.info_provider", provider=resolved.provider or "openrouter"),
+            model_line,
+            t("gateway.session.info_provider", provider=provider_name),
             t("gateway.session.info_context", tokens=ctx_display, source=ctx_source),
         ]
         if (resolved.provider or "") == "moa":

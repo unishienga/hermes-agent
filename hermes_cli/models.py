@@ -2526,6 +2526,8 @@ def opencode_provider_family(provider_id: Optional[str]) -> Optional[str]:
     predicate is the single owner of that family-membership question; do not re-implement it inline.
     """
     raw = str(provider_id or "").strip().lower()
+    if raw.startswith("custom:"):
+        raw = raw.split(":", 1)[1].strip()
     if not raw:
         return None
     canonical = normalize_provider(provider_id)

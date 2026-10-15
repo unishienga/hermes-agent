@@ -1,9 +1,12 @@
 """Tests for GatewayRunner._format_session_info — session config surfacing."""
 
+import json
+
 import pytest
 from unittest.mock import patch
 
 from gateway.run import GatewayRunner
+from gateway.run_turn import _router_resolved_for_tier, _router_resolved_model_for_tier
 
 
 @pytest.fixture()
@@ -112,6 +115,73 @@ class TestFormatSessionInfo:
         assert "262K" in info
         assert "config" in info
         assert "131K" not in info
+
+
+class TestRouterTierModelBanner:
+    """The banner must name the concrete model behind a shienga router tier."""
+
+    def _snapshot(self, tmp_path, model="hermes-medium", resolved="deepseek-v4.1-flash", **entry):
+        payload = {"provider": "ocg-coder-5", "model": resolved, "executor": "opencode-tfny", "executor_label": "OPENCODE-TFNY"}
+        payload.update(entry)
+        path = tmp_path / "resolved.json"
+        path.write_text(json.dumps({"resolved": {model: payload}}))
+        return path
+
+    def test_helper_reads_the_tier_resolution(self, tmp_path):
+        snapshot = self._snapshot(tmp_path)
+        with patch("gateway.run_turn._router_resolved_path", return_value=snapshot):
+            assert _router_resolved_model_for_tier("hermes-medium") == "deepseek-v4.1-flash"
+
+    def test_helper_reads_the_serving_account(self, tmp_path):
+        snapshot = self._snapshot(tmp_path)
+        with patch("gateway.run_turn._router_resolved_path", return_value=snapshot):
+            assert _router_resolved_for_tier("hermes-medium")["provider"] == "OPENCODE-TFNY"
+
+    def test_helper_provider_falls_back_to_executor_then_family(self, tmp_path):
+        no_label = self._snapshot(tmp_path, executor_label=None)
+        with patch("gateway.run_turn._router_resolved_path", return_value=no_label):
+            assert _router_resolved_for_tier("hermes-medium")["provider"] == "opencode-tfny"
+
+    def test_helper_ignores_non_tier_models(self, tmp_path):
+        snapshot = self._snapshot(tmp_path, model="hermes-medium")
+        with patch("gateway.run_turn._router_resolved_path", return_value=snapshot):
+            assert _router_resolved_model_for_tier("deepseek-v4.1-flash") == ""
+            assert _router_resolved_for_tier("deepseek-v4.1-flash") == {}
+
+    def test_helper_is_empty_when_snapshot_missing(self, tmp_path):
+        with patch("gateway.run_turn._router_resolved_path", return_value=tmp_path / "missing.json"):
+            assert _router_resolved_model_for_tier("hermes-medium") == ""
+            assert _router_resolved_for_tier("hermes-medium") == {}
+
+    def test_banner_appends_the_routed_model_after_the_tier(self, runner, tmp_path):
+        snapshot = self._snapshot(tmp_path)
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: hermes-medium\n  provider: custom\n  base_url: http://127.0.0.1:19876/v1\n",
+            "hermes-medium",
+            {"provider": "custom", "base_url": "http://127.0.0.1:19876/v1", "api_key": ""},
+        )
+        with p1, p2, p3, patch("gateway.run_turn._router_resolved_path", return_value=snapshot):
+            info = runner._format_session_info()
+        assert "hermes-medium" in info
+        assert "deepseek-v4.1-flash" in info
+        # The router hop must not be reported as the provider.
+        assert "Provider: custom" not in info
+        assert "OPENCODE-TFNY" in info
+
+    def test_banner_unchanged_for_a_concrete_model(self, runner, tmp_path):
+        snapshot = self._snapshot(tmp_path)
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: deepseek-v4.1-flash\n  provider: custom\n  base_url: http://127.0.0.1:19876/v1\n",
+            "deepseek-v4.1-flash",
+            {"provider": "custom", "base_url": "http://127.0.0.1:19876/v1", "api_key": ""},
+        )
+        with p1, p2, p3, patch("gateway.run_turn._router_resolved_path", return_value=snapshot):
+            info = runner._format_session_info()
+        assert "deepseek-v4.1-flash" in info
+        # No second, routed model appended for an already-concrete model.
+        assert info.count("deepseek-v4.1-flash") == 1
 
 
 class TestResetNoticeSessionInfo:

@@ -1941,7 +1941,8 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     return until is None or until - time.time() > 600
 
 
-def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
+def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set,
+                                    reason: FailoverReason | None = None) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
     if fb_key in unavailable:
@@ -1965,14 +1966,22 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     # are owned by agent.backend_identity — do not re-implement comparisons here.
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
     # See #22548, #62984, #70893.
-    from agent.backend_identity import BackendIdentity, should_skip_candidate
+    from agent.backend_identity import BackendIdentity, FailureScope, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
     fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
-    if should_skip_candidate(fb_ident, current_ident):
+    # Auth, billing and account throttling invalidate one credential, not every account
+    # serving the same model at the same URL. Upstream model limits remain model-scoped.
+    scope = FailureScope.MODEL
+    if reason in {FailoverReason.auth, FailoverReason.auth_permanent,
+                  FailoverReason.billing, FailoverReason.rate_limit}:
+        scope = FailureScope.CREDENTIAL
+    elif reason == FailoverReason.ssl_cert_verification:
+        scope = FailureScope.ENDPOINT
+    if should_skip_candidate(fb_ident, current_ident, scope):
         logger.warning(
-            "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
-            fb_provider, fb_model, current_ident.base_url or current_ident.provider)
+            "Fallback skip: chain entry %s/%s shares the failed %s with the current route (%s)",
+            fb_provider, fb_model, scope.value, current_ident.base_url or current_ident.provider)
         return True
     return False
 
@@ -2071,7 +2080,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
-        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable, reason):
             continue
 
         try:

@@ -186,6 +186,15 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
         # Availability probe: resolved credentials/base_url are the answer.
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
+    with contextlib.suppress(Exception):
+        from agent.anthropic_endpoints import _is_opencode_endpoint
+        from agent.opencode_affinity import OPENCODE_SESSION_HEADER, opencode_session_headers
+        if _is_opencode_endpoint(base_url):
+            dh = dict(kwargs.get("default_headers") or {})
+            for header_name, header_value in opencode_session_headers("opencode-njgf", base_url).items():
+                dh.setdefault(header_name, header_value)
+            dh.setdefault(OPENCODE_SESSION_HEADER, "hermes-host")
+            kwargs["default_headers"] = dh
     _apply_required_codex_headers(kwargs, access_token=api_key, base_url=base_url)
     # Hermes owns aux retry/fallback policy; the SDK default (max_retries=2) would triple
     # wall time on a hung endpoint before Hermes sees one failure.
