@@ -6,7 +6,7 @@ import copy
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from tools.registry import tool_error
 from tools.tool_search_catalog import BRIDGE_TOOL_NAMES, _registry_entry
@@ -136,6 +136,75 @@ def validate_deferred_call_args(name: str, args: dict[str, Any]) -> Optional[str
         return None
 
 
+_CALLS_EXCERPT_RADIUS = 60
+
+
+def _parse_calls_string(raw: str) -> tuple[Optional[Any], Optional[json.JSONDecodeError]]:
+    """Parse a ``calls`` value the model sent as a JSON string.
+
+    Two shapes reach here that ``json.loads`` alone rejects and that are safe to
+    accept: a fenced block (```json ... ```) and Python-repr quoting (single
+    quotes — seen live as ``Expecting property name enclosed in double quotes``).
+    Neither rewrites the caller's content, so a repaired parse cannot change which
+    tool is invoked or with what arguments.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError as exc:
+        first_error = exc
+    try:
+        import ast
+
+        return ast.literal_eval(text), None
+    except (ValueError, SyntaxError):
+        return None, first_error
+
+
+def _recover_arguments_prefix(raw: str) -> Optional[str]:
+    """Return the ``arguments`` object from a ``calls`` string cut short at it.
+
+    Observed live, byte-exact: the delivered value was ``[{"arguments": {…}`` —
+    the entry's ``name`` and every closing bracket missing, which ``json.loads``
+    reports as ``Expecting ',' delimiter`` at the offset where the comma would
+    have been. The arguments themselves survive verbatim; only the tool name is
+    gone, so this recovers evidence for the caller, never a dispatch.
+    """
+    match = re.match(r'\s*\[\s*\{\s*"arguments"\s*:\s*', raw)
+    if not match:
+        return None
+    try:
+        value, _ = json.JSONDecoder().raw_decode(raw[match.end():])
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(", ", ": "))
+
+
+def _calls_string_error(raw: str, exc: json.JSONDecodeError) -> str:
+    """Actionable rejection for a ``calls`` JSON string that will not parse.
+
+    A bare JSONDecodeError is unusable to the caller: it cannot see the string it
+    sent, so it re-sends it identically (observed live: six identical retries in
+    one turn). Name the offset, and when the failure is the truncation above, hand
+    back the arguments that survived so the retry costs one call, not a rethink.
+    """
+    recovered = _recover_arguments_prefix(raw)
+    if recovered is not None:
+        return (f"tool_call 'calls' is not valid JSON: {exc}. The value stops at the close of the "
+                f'"arguments" object, so the entry\'s "name" and every closing bracket are missing. '
+                f"Your arguments survived verbatim: {recovered}. Re-send as "
+                f'{{"calls": [{{"name": "<tool>", "arguments": {recovered}}}]}}')
+    position = getattr(exc, "pos", 0)
+    window = raw[max(0, position - _CALLS_EXCERPT_RADIUS): position + _CALLS_EXCERPT_RADIUS]
+    return (f"tool_call 'calls' is not valid JSON: {exc}. Near position {position}: ...{window}... "
+            f'Expected shape: {{"calls": [{{"name": "<tool>", "arguments": {{...}}}}]}}')
+
+
 def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Normalize ``tool_call`` arguments into a ``calls[]`` list of entries.
 
@@ -154,10 +223,16 @@ def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, An
     if isinstance(raw_calls, str):
         # Tolerate the model emitting the batch envelope as a JSON string —
         # mirror the per-entry `arguments` handling below (#114484).
-        try:
-            raw_calls = json.loads(raw_calls)
-        except json.JSONDecodeError as e:
-            return [], f"tool_call 'calls' is not valid JSON: {e}"
+        parsed, parse_error = _parse_calls_string(raw_calls)
+        if parse_error is not None:
+            return [], _calls_string_error(raw_calls, parse_error)
+        # The string may carry the whole envelope ({"calls": [...]}), not just the
+        # entry list — the shape this tolerance was written for. Parsing it and
+        # then treating that dict as a single entry demanded a 'name' it cannot
+        # have, so the documented tolerance failed on its own documented shape.
+        if isinstance(parsed, dict) and isinstance(parsed.get("calls"), (list, dict)):
+            parsed = parsed["calls"]
+        raw_calls = parsed
     if isinstance(raw_calls, dict):
         raw_calls = [raw_calls]
     if not isinstance(raw_calls, list) or not raw_calls:
