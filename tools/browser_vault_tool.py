@@ -198,18 +198,77 @@ _TAB_PROBES = {
 }
 
 
-def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
+def _focus_bound_page(task_id: str, origin: str, kind: str, target_id: Optional[str] = None) -> Optional[dict]:
     """Point the supervisor's page session at the open tab on ``origin`` that holds a ``kind`` form
     (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
-    login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
+    login page). ``target_id`` pins the exact tab. Returns the supervisor's focus record (``url``/
+    ``target_id``/``visible``/``focused``/``candidates``) when a tab was focused, else None (caller falls
+    back to the current page)."""
     try:
         supervisor = _ensure_supervisor(task_id)
     except Exception:
         supervisor = None
     if supervisor is None:
         return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
-    return (origin or focused.get("url")) if focused.get("ok") else None
+    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind), target_id=target_id)
+    return focused if focused.get("ok") else None
+
+
+def _agent_tab(task_id: str) -> Optional[dict]:
+    """Ask the agent's OWN browser session which tab the agent is attached to.
+
+    The supervisor is a second CDP client on the same browser: it can enumerate targets, but it cannot
+    see which of them the agent's daemon has attached. Several tabs on one origin all redirect to /login
+    once their session expires, so *every* one of them passes the password-field probe — picking by
+    order writes the credential into a tab the agent is not looking at. Only the daemon that runs
+    browser_exec knows the answer, so ask it. Returns ``{"targetId", "url"}`` or None (no daemon, not
+    attached, or the call failed — callers then fall back to the probe heuristics).
+    """
+    try:
+        from tools.browser_use_cli import browser_exec
+        raw = browser_exec("import json\nprint(json.dumps({'tab': current_tab()}))\n",
+                           task_id=task_id, timeout_s=20)
+    except Exception:
+        return None
+    text = raw if isinstance(raw, str) else str(raw)
+
+    def _tab_from(obj: Any, depth: int = 0) -> Optional[dict]:
+        """browser_exec wraps the snippet's stdout in its own envelope (and may redact it), so walk
+        dicts and embedded JSON strings until the tab record surfaces."""
+        if depth > 4:
+            return None
+        if isinstance(obj, dict):
+            if "targetId" in obj and "url" in obj:
+                return obj
+            for key in ("tab", "output", "result", "stdout", "data"):
+                if key in obj:
+                    found = _tab_from(obj[key], depth + 1)
+                    if found:
+                        return found
+            return None
+        if isinstance(obj, str):
+            try:
+                return _tab_from(json.loads(obj), depth + 1)
+            except ValueError:
+                pass
+            for line in reversed(obj.splitlines()):
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        found = _tab_from(json.loads(line), depth + 1)
+                    except ValueError:
+                        continue
+                    if found:
+                        return found
+        return None
+
+    return _tab_from(text)
+
+
+def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
+    """Origin-only view of :func:`_focus_bound_page`, for callers that just need the side effect."""
+    focused = _focus_bound_page(task_id, origin, kind)
+    return (origin or focused.get("url")) if focused else None
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +354,10 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
 
     effective_task_id = task_id or "default"
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
-    # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
+    # the daemon's blank tab); the login form lives in the tab with a password field — pinned to the tab
+    # the agent is actually driving when that is known.
+    if not _focus_bound_page(effective_task_id, "", "login", target_id=(_agent_tab(effective_task_id) or {}).get("targetId")):
+        _focus_bound_page(effective_task_id, "", "login")
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
@@ -342,7 +403,9 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
-    _focus_bound_origin(effective_task_id, "", "otp")
+    # Pin to the tab the agent is driving, then fall back to the form probe.
+    if not _focus_bound_page(effective_task_id, "", "otp", target_id=(_agent_tab(effective_task_id) or {}).get("targetId")):
+        _focus_bound_page(effective_task_id, "", "otp")
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
@@ -454,11 +517,23 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # every saved origin is a valid fill target. Matching stays exact-origin —
     # nothing wildcard/parent-domain is ever inferred.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+    agent_tab = _agent_tab(effective_task_id)
     page_origin = None
+    page_focus = None
     for candidate in allowed:
-        page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
+        page_focus = _focus_bound_page(effective_task_id, candidate, meta.kind,
+                                       target_id=(agent_tab or {}).get("targetId"))
+        page_origin = (candidate or page_focus.get("url")) if page_focus else None
         if page_origin:
             break
+    if page_focus is None:
+        # The agent's tab could not be identified (no daemon, or it is not on a bound origin):
+        # fall back to the probe heuristics rather than refusing a legitimate fill.
+        for candidate in allowed:
+            page_focus = _focus_bound_page(effective_task_id, candidate, meta.kind)
+            page_origin = (candidate or page_focus.get("url")) if page_focus else None
+            if page_origin:
+                break
     page_origin = page_origin or _current_page_origin(effective_task_id)
     if not page_origin:
         return json.dumps(
@@ -560,6 +635,19 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
+    if page_focus:
+        # The write is only useful in the tab the agent will SUBMIT from. Several expired tabs on one
+        # origin all redirect to /login, so the form probe alone cannot tell them apart; report which
+        # tab took the secret and let the agent correlate with its own page.
+        out["page"] = {"url": page_focus.get("url"), "target_id": page_focus.get("target_id")}
+        pinned = bool(agent_tab and page_focus.get("target_id") == agent_tab.get("targetId"))
+        out["page"]["agent_tab"] = pinned
+        if filled and not pinned and not page_focus.get("focused") and int(page_focus.get("candidates") or 1) > 1:
+            out["warning"] = (
+                f"Filled a tab the browser did not report as focused ({page_focus.get('url')}) and could not "
+                f"confirm it is the tab you are driving. {page_focus.get('candidates')} tabs on this origin "
+                "held the form, so the credentials may have landed in a different one. Check before "
+                "submitting, or close the extra tabs and re-run the fill.")
     if meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))

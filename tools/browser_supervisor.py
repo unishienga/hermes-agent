@@ -265,23 +265,39 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             value = result_obj.get("description") or result_obj.get("unserializableValue")
         return {"ok": True, "result": value, "result_type": result_type}
 
-    def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> dict[str, Any]:
+    def focus_page(self, origin: str, *, accept: Optional[str] = None,
+                   target_id: Optional[str] = None, timeout: float = 10.0) -> dict[str, Any]:
         """Re-attach the supervisor's page session to an open page target on ``origin``
         (``scheme://host[:port]``). The initial attach picks the FIRST page target, but tools
         that open their own tabs (browser_exec) put the login form somewhere else. With
         ``accept`` (a JS expression) the first same-origin tab where it evaluates truthy wins,
         so a login and a checkout tab on one site resolve to the right one. Returns
-        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays."""
+        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays.
+
+        ``target_id`` pins the attach to exactly that tab (used when the caller knows which tab
+        the agent is driving). Without it, a site with SEVERAL tabs that all pass ``accept``
+        (typically several login pages left open by earlier attempts — every one of them gets
+        bounced to /login once its session expires) used to resolve to whichever tab Chrome
+        listed first, so a credential was written into a tab nobody was looking at while the
+        agent submitted the empty form in its own. The tie-break is the browser's own view of
+        the page: the FOCUSED tab wins, then a visible one, then the first — and the chosen
+        identity is returned so the caller can see where the write went.
+        """
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
 
-        async def _attach(target_id: str) -> str:
-            attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
+        async def _attach(tid: str) -> str:
+            attach = await self._cdp("Target.attachToTarget", {"targetId": tid, "flatten": True}, timeout=timeout)
             sid = attach["result"]["sessionId"]
             await self._enable_page_domains(sid, timeout=timeout)
             await self._install_dialog_bridge(sid)
             return sid
+
+        async def _eval(sid: str, expression: str) -> Any:
+            probe = await self._cdp("Runtime.evaluate", {"expression": expression, "returnByValue": True},
+                                    session_id=sid, timeout=timeout)
+            return probe.get("result", {}).get("result", {}).get("value")
 
         async def _focus() -> dict[str, Any]:
             from agent.vault_store import normalize_origin
@@ -296,18 +312,41 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                         candidates.append((t["targetId"], url))
                 except Exception:
                     continue
-            for target_id, url in candidates:
-                sid = await _attach(target_id)
-                if accept:
-                    probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
-                                            session_id=sid, timeout=timeout)
-                    if not probe.get("result", {}).get("result", {}).get("value"):
+            if target_id:
+                pinned = [(tid, url) for tid, url in candidates if tid == target_id]
+                if not pinned:
+                    return _fail(f"target {target_id} is not an open page on {origin or 'any site'}")
+                candidates = pinned
+            if not candidates:
+                return _fail(f"no open page on {origin or 'any site'}")
+
+            attached: list[tuple[str, str, str, bool, bool]] = []
+            for tid, url in candidates:
+                sid = await _attach(tid)
+                if accept and not await _eval(sid, accept):
+                    await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
+                    continue
+                state = await _eval(sid, "({visible: document.visibilityState === 'visible', "
+                                         "focused: document.hasFocus()})")
+                state = state if isinstance(state, dict) else {}
+                attached.append((tid, url, sid, bool(state.get("visible")), bool(state.get("focused"))))
+            if not attached:
+                return _fail(f"no open page on {origin or 'any site'}"
+                             + (" with the expected form" if accept else ""))
+
+            chosen = next((c for c in attached if c[4]), None) \
+                or next((c for c in attached if c[3]), None) \
+                or attached[0]
+            for tid, _url, sid, _v, _f in attached:
+                if sid != chosen[2]:
+                    try:
                         await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
-                        continue
-                with self._state_lock:
-                    self._page_session_id = sid
-                return {"ok": True, "url": url}
-            return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
+                    except Exception:
+                        pass
+            with self._state_lock:
+                self._page_session_id = chosen[2]
+            return {"ok": True, "url": chosen[1], "target_id": chosen[0],
+                    "visible": chosen[3], "focused": chosen[4], "candidates": len(attached)}
 
         try:
             return _schedule(_focus(), loop, timeout=timeout + 1)

@@ -378,6 +378,126 @@ class TestBrowserVaultTools:
         assert out["error_type"] == "origin_mismatch"
         assert "s3cret-pw" not in json.dumps(out)
 
+    def test_fill_writes_into_the_tab_the_agent_is_driving_not_the_first_login_tab(self, store):
+        """Regression (SWAH-555): every expired tab on one origin redirects to /login, so the
+        password-field probe passes on all of them and "first target wins" wrote the credential into a
+        tab nobody was looking at. The fill must ask the agent's own browser session which tab it is
+        attached to and pin the supervisor to exactly that one."""
+        from tools import browser_vault_tool
+
+        meta = _add_login(store)
+        seen = {}
+        controls = [
+            {"autocomplete": "email", "formIndex": 0, "index": 0, "label": "", "name": "email", "type": "email"},
+            {"autocomplete": "current-password", "formIndex": 0, "index": 1, "label": "", "name": "pw", "type": "password"},
+        ]
+
+        def fake_agent_tab(task_id):
+            seen["agent_tab_asked"] = task_id
+            return {"targetId": "TAB-AGENT", "url": "https://example.com/login"}
+
+        def fake_focus(task_id, origin, kind, target_id=None):
+            seen.setdefault("focus_calls", []).append(target_id)
+            if target_id == "TAB-AGENT":
+                return {"ok": True, "url": "https://example.com/login", "target_id": "TAB-AGENT",
+                        "visible": False, "focused": False, "candidates": 2}
+            return None  # the un-pinned heuristic would have picked the other tab
+
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_agent_tab", side_effect=fake_agent_tab), \
+             patch.object(browser_vault_tool, "_focus_bound_page", side_effect=fake_focus), \
+             patch.object(browser_vault_tool, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
+             patch.object(browser_vault_tool, "_eval_js_secret",
+                          return_value={"success": True, "result": json.dumps({"filled": 1})}):
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="t"))
+
+        assert out["success"] is True
+        assert seen["focus_calls"][0] == "TAB-AGENT"      # pinned to the agent's tab first
+        assert out["page"]["target_id"] == "TAB-AGENT"
+        assert out["page"]["agent_tab"] is True
+        assert "warning" not in out                        # a confirmed tab is not a guess
+        assert "s3cret-pw" not in json.dumps(out)
+
+    def test_fill_warns_when_it_could_not_confirm_the_tab(self, store):
+        """When the agent's tab cannot be resolved the fill still runs (fail-open, as before) but the
+        result must say the landing tab is unconfirmed — the old silent success is what let the defect
+        hide for two sessions."""
+        from tools import browser_vault_tool
+
+        meta = _add_login(store)
+        controls = [
+            {"autocomplete": "email", "formIndex": 0, "index": 0, "label": "", "name": "email", "type": "email"},
+            {"autocomplete": "current-password", "formIndex": 0, "index": 1, "label": "", "name": "pw", "type": "password"},
+        ]
+
+        def fake_focus(task_id, origin, kind, target_id=None):
+            if target_id:
+                return None  # agent tab not on a bound origin
+            return {"ok": True, "url": "https://example.com/login", "target_id": "TAB-OTHER",
+                    "visible": False, "focused": False, "candidates": 3}
+
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_agent_tab", return_value=None), \
+             patch.object(browser_vault_tool, "_focus_bound_page", side_effect=fake_focus), \
+             patch.object(browser_vault_tool, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
+             patch.object(browser_vault_tool, "_eval_js_secret",
+                          return_value={"success": True, "result": json.dumps({"filled": 1})}):
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="t"))
+
+        assert out["success"] is True
+        assert out["page"]["agent_tab"] is False
+        assert "different one" in out["warning"]
+        assert "s3cret-pw" not in json.dumps(out)
+
+    def test_agent_tab_reads_the_daemons_current_tab_through_its_envelope(self):
+        """``_agent_tab`` must survive browser_exec's result envelope (and its redaction pass) and
+        return the tab record, or None when the daemon has nothing attached."""
+        from tools import browser_vault_tool
+
+        record = {"targetId": "ABC123", "url": "https://example.com/login", "title": "Sign in"}
+        envelope = json.dumps({"success": True, "output": f"noise\n{json.dumps({'tab': record})}\n"})
+        with patch("tools.browser_use_cli.browser_exec", return_value=envelope):
+            assert browser_vault_tool._agent_tab("t") == record
+
+        with patch("tools.browser_use_cli.browser_exec", return_value='{"error": "not_attached"}'):
+            assert browser_vault_tool._agent_tab("t") is None
+
+        with patch("tools.browser_use_cli.browser_exec", side_effect=RuntimeError("no daemon")):
+            assert browser_vault_tool._agent_tab("t") is None
+
+    def test_otp_is_pinned_to_the_agent_tab_too(self, store):
+        """The code must go where the password went; a probe-only focus can land on another tab."""
+        from tools import browser_vault_tool
+
+        meta = _add_login(store)
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code",
+                     "autocomplete": "one-time-code"}]
+        calls = []
+
+        def fake_focus(task_id, origin, kind, target_id=None):
+            calls.append(target_id)
+            return {"ok": True, "url": "https://example.com/2fa", "target_id": target_id or "TAB-OTHER",
+                    "visible": True, "focused": True, "candidates": 2}
+
+        from agent.vault_backends import unlock as unlock_mod
+        unlock_mod.set_code_prompt_callback(lambda site, hint: "123456")
+        try:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
+                 patch.object(browser_vault_tool, "_agent_tab", return_value={"targetId": "TAB-AGENT",
+                                                                             "url": "https://example.com/2fa"}), \
+                 patch.object(browser_vault_tool, "_current_page_origin", return_value="https://example.com"), \
+                 patch.object(browser_vault_tool, "_focus_bound_page", side_effect=fake_focus), \
+                 patch.object(browser_vault_tool, "_eval_js",
+                              return_value={"success": True, "result": json.dumps(controls)}), \
+                 patch.object(browser_vault_tool, "_eval_js_secret",
+                              return_value={"success": True, "result": json.dumps({"filled": 1})}):
+                out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"))
+        finally:
+            unlock_mod.set_code_prompt_callback(None)
+        assert out["success"] is True, out
+        assert calls[0] == "TAB-AGENT"
+
     def test_fill_unknown_handle(self, store):
         from tools import browser_vault_tool
 
@@ -764,7 +884,8 @@ class TestTwoFactor:
             return {"success": True, "result": json.dumps({"filled": 1})}
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
-             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_focus_bound_page", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_agent_tab", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
              patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
             raw = browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t")
@@ -789,7 +910,8 @@ class TestTwoFactor:
             return {"success": True, "result": json.dumps({"filled": 6})}
 
         with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
-             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_focus_bound_page", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_agent_tab", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
              patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
