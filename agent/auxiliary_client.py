@@ -13,6 +13,7 @@ import contextvars
 import functools
 import hashlib
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ import time
 import uuid
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING, Union
-from urllib.parse import urlparse, parse_qs, urlunparse
+from urllib.parse import urlparse, urlsplit, parse_qs, urlunparse
 
 from agent.local_prompt_progress import (
     PromptReadingClock, current_prompt_reading_hook, prompt_progress, prompt_reading_hook, with_prompt_progress)
@@ -147,6 +148,7 @@ _LOGGED_UNKNOWN_PROVIDER_KEYS: set = set()
 _LOGGED_UNHANDLED_AUTHTYPE_KEYS: set = set()
 _LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
 _LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
+_LOGGED_LOOPBACK_KEYLESS: set = set()
 
 
 def _resolve_aux_verify(base_url: Optional[str]) -> Any:
@@ -5053,6 +5055,36 @@ def _named_custom_openai_wire_client(custom_base: str, custom_key: Any, extra_he
     return _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
 
 
+def _base_url_is_loopback(base_url: Any) -> bool:
+    """True when ``base_url`` targets this host (127.0.0.0/8, localhost, ::1, 0.0.0.0).
+
+    A loopback endpoint authenticates no caller, so the ``no-key-required`` placeholder IS its
+    correct credential. Judging that case by "a key was not resolved" alone produced a WARNING per
+    auxiliary call against the local Hermes router (SWAH-651/SWAH-653), which read as proof the
+    router needed a credential and sent investigators chasing an auth failure that did not exist.
+    """
+    value = str(base_url or "").strip()
+    if not value:
+        return False
+    try:
+        host = urlsplit(value).hostname or ""
+    except ValueError:
+        host = ""
+    host = host.strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a domain name like "127.0.0.1.example.com" is not loopback
+    return ip.is_loopback or ip.is_unspecified
+
+
+def _should_warn_missing_custom_key(custom_key: Any, custom_base: str) -> bool:
+    """Warn only where the placeholder credential can actually 401: a NON-loopback endpoint."""
+    return str(custom_key or "") == "no-key-required" and not _base_url_is_loopback(custom_base)
+
+
 def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResult]:
     """Named custom provider (config.yaml providers dict / custom_providers list); None if no entry matches."""
     from hermes_cli.runtime_provider import _get_named_custom_provider
@@ -5073,9 +5105,15 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
     custom_base = (req.explicit_base_url or custom_entry.get("base_url") or "").strip()
     custom_key = _normalize_api_key(req.explicit_api_key) or _named_custom_api_key(custom_entry, provider, custom_base)
     if custom_key == "no-key-required":
-        logger.warning("resolve_provider_client: named custom provider %r has no resolvable "
-                       "api_key — request will be sent with placeholder no-key-required "
-                       "and will 401 on auth-required endpoints", custom_entry.get("name") or provider)
+        if _base_url_is_loopback(custom_base):
+            # The local loopback router authenticates no caller: the placeholder is correct there.
+            _log_once_debug(_LOGGED_LOOPBACK_KEYLESS, custom_base,
+                            "resolve_provider_client: named custom provider %r is loopback; "
+                            "using the no-key-required placeholder", custom_entry.get("name") or provider)
+        elif _should_warn_missing_custom_key(custom_key, custom_base):
+            logger.warning("resolve_provider_client: named custom provider %r has no resolvable "
+                           "api_key — request will be sent with placeholder no-key-required "
+                           "and will 401 on auth-required endpoints", custom_entry.get("name") or provider)
     # Actual's wire protocol takes precedence over persisted task/provider modes.
     entry_api_mode = (req.api_mode or custom_entry.get("api_mode") or "").strip()
     if _is_actual_auxiliary_route(req, custom_base):
